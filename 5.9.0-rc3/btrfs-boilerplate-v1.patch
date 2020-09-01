@@ -1,8 +1,8 @@
-From cde4314acb29b2d55691ba2e40a7665ec8ca6dcf Mon Sep 17 00:00:00 2001
-Message-Id: <cde4314acb29b2d55691ba2e40a7665ec8ca6dcf.1598967225.git.anand.jain@oracle.com>
+From 9216ea809d21918272b6a95a2d4b4af28ddd7d12 Mon Sep 17 00:00:00 2001
+Message-Id: <9216ea809d21918272b6a95a2d4b4af28ddd7d12.1598971713.git.anand.jain@oracle.com>
 From: Anand Jain <Anand.Jain@oracle.com>
 Date: Mon, 29 Sep 2014 13:09:00 +0800
-Subject: [PATCH] btrfs: boilerplate v1
+Subject: [PATCH] btrfs: boilerplate: devlist and fsinfo
 
 ** This patch is not for integration but to debug/visualize the
 btrfs device list and fs_info. **
@@ -14,10 +14,10 @@ usage:
 Signed-off-by: Anand Jain <anand.jain@oracle.com>
 ---
  fs/btrfs/Makefile |   2 +-
- fs/btrfs/procfs.c | 622 ++++++++++++++++++++++++++++++++++++++++++++++
+ fs/btrfs/procfs.c | 627 ++++++++++++++++++++++++++++++++++++++++++++++
  fs/btrfs/procfs.h |   2 +
  fs/btrfs/super.c  |   6 +-
- 4 files changed, 630 insertions(+), 2 deletions(-)
+ 4 files changed, 635 insertions(+), 2 deletions(-)
  create mode 100644 fs/btrfs/procfs.c
  create mode 100644 fs/btrfs/procfs.h
 
@@ -36,10 +36,10 @@ index e738f6206ea5..dc27f3c95b05 100644
  btrfs-$(CONFIG_BTRFS_FS_CHECK_INTEGRITY) += check-integrity.o
 diff --git a/fs/btrfs/procfs.c b/fs/btrfs/procfs.c
 new file mode 100644
-index 000000000000..5d2c4ef2b832
+index 000000000000..b9945f926e12
 --- /dev/null
 +++ b/fs/btrfs/procfs.c
-@@ -0,0 +1,622 @@
+@@ -0,0 +1,627 @@
 +#include <linux/seq_file.h>
 +#include <linux/vmalloc.h>
 +#include <linux/proc_fs.h>
@@ -415,6 +415,11 @@ index 000000000000..5d2c4ef2b832
 +		BTRFS_SEQ_PRINT("\t\tdev_state:\t0x%lx\n", device->dev_state);
 +	} else {
 +		BTRFS_SEQ_PRINT("\t\tdev_state:\t%s\n", dev_state_str);
++	}
++	if (device->devid_kobj.state_initialized) {
++		BTRFS_SEQ_PRINT("\tdevid_kobj:\t\t%d\n", device->devid_kobj.state_initialized);
++	} else {
++		BTRFS_SEQ_PRINT("\tdevid_kobj:\t\t%s\n", "null");
 +	}
 +	BTRFS_SEQ_PRINT("\t\tbdev:\t\t%s\n", device->bdev ? "not_null":"null");
 +	if (device->bdev) {
