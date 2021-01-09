@@ -1,0 +1,144 @@
+From dbb6ab63498f079807f8f34cc9d59be457de085f Mon Sep 17 00:00:00 2001
+Message-Id: <dbb6ab63498f079807f8f34cc9d59be457de085f.1599038303.git.anand.jain@oracle.com>
+From: Anand Jain <anand.jain@oracle.com>
+Date: Mon, 15 Jun 2020 18:41:41 +0800
+Subject: [PATCH] btrfs: boilerplates: add device queue and read_policy
+
+Signed-off-by: root <root@ca-dev104.us.oracle.com>
+---
+ fs/btrfs/procfs.c | 63 +++++++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 58 insertions(+), 5 deletions(-)
+
+diff --git a/fs/btrfs/procfs.c b/fs/btrfs/procfs.c
+index 69a00f69a487..f48ab3555428 100644
+--- a/fs/btrfs/procfs.c
++++ b/fs/btrfs/procfs.c
+@@ -1,6 +1,7 @@
+ #include <linux/seq_file.h>
+ #include <linux/vmalloc.h>
+ #include <linux/proc_fs.h>
++#include <linux/part_stat.h>
+ #include "ctree.h"
+ #include "volumes.h"
+ #include "rcu-string.h"
+@@ -17,6 +18,8 @@
+ //#define FS_OPEN_RW
+ #define BALANCE_RUNNING
+ //#define OLD_PROC
++#define READ_POLICY
++#define BLOCK_STAT
+ 
+ struct proc_dir_entry	*btrfs_proc_root;
+ 
+@@ -313,9 +316,9 @@ static void dev_state_to_str(struct btrfs_device *device, char *dev_state_str)
+ 		strcat(dev_state_str, "|REPLACE_TGT");
+ 	if (test_bit(BTRFS_DEV_STATE_FLUSH_SENT, &device->dev_state))
+ 		strcat(dev_state_str, "|FLUSH_SENT");
+-#ifdef READPOLICY
+-	if (test_bit(BTRFS_DEV_STATE_RD_PREFERRED, &device->dev_state))
+-		strcat(dev_state_str, "|RD_PREFFRRED");
++#ifdef READ_POLICY
++	if (test_bit(BTRFS_DEV_STATE_READ_PREFERRED, &device->dev_state))
++		strcat(dev_state_str, "|READ_PREFFRRED");
+ #endif
+ 	if (device->dev_stats_valid)
+ 		strcat(dev_state_str, "|dev_stats_valid");
+@@ -351,6 +354,7 @@ static void print_a_fs_device(struct seq_file *seq, struct btrfs_fs_devices *fs_
+ 
+ 
+ 	char str[BPSL];
++	struct btrfs_device *device;
+ 
+ 	if (sprt) {
+ 		BTRFS_SEQ_PRINT("[[seed_fsid: %pU]]\n", fs_devices->fsid);
+@@ -388,22 +392,31 @@ static void print_a_fs_device(struct seq_file *seq, struct btrfs_fs_devices *fs_
+ 		BTRFS_SEQ_PRINT("\tkobj_insysfs:\t\t%s\n", "null");
+ 	}
+ 
+-#ifdef READPOLICY
++#ifdef READ_POLICY
+ 	switch (fs_devices->read_policy) {
+ 	case BTRFS_READ_POLICY_PID:
+ 		BTRFS_SEQ_PRINT2("\tread_policy\t\t%s\n", "BTRFS_READ_POLICY_PID:");
+ 		break;
+ 	case BTRFS_READ_POLICY_DEVICE:
+ 		list_for_each_entry(device, &fs_devices->devices, dev_list) {
+-			if (test_bit(BTRFS_DEV_STATE_RD_PREFERRED, &device->dev_state)) {
++
++			if (test_bit(BTRFS_DEV_STATE_READ_PREFERRED,
++						&device->dev_state)) {
+ 				BTRFS_SEQ_PRINT("%llu ", device->devid);
+ 			}
+ 		}
+ 		BTRFS_SEQ_PRINT("%s\n", " ");
+ 		break;
++	case BTRFS_READ_POLICY_BALANCE:
++		BTRFS_SEQ_PRINT2("\tread_policy\t\t%s\n", "BTRFS_READ_POLICY_BALANCE:");
++		break;
++	case BTRFS_READ_POLICY_ROUND_ROBIN:
++		BTRFS_SEQ_PRINT2("\tread_policy\t\t%s\n", "BTRFS_READ_POLICY_ROUND_ROBIN:");
++		break;
+ 	default:
+ 		BTRFS_SEQ_PRINT2("\tread_policy\t%s\n", "unknown\n");
+ 	}
++	BTRFS_SEQ_PRINT("\ttotal_reads:\t\t%llu\n", fs_devices->total_reads);
+ #endif
+ }
+ 
+@@ -425,6 +438,14 @@ static void print_a_device(struct seq_file *seq, struct btrfs_device *device,
+ 
+ 	char str[BPSL];
+ 	char dev_state_str[256] = {0};
++#ifdef BLOCK_STAT
++	struct disk_stats stat;
++	unsigned int total_sectors;
++	unsigned int estimated_wait;
++	unsigned int avg_wait_msecs;
++	unsigned int total_wait_msecs;
++	unsigned int inflight;
++#endif
+ 
+ 	BTRFS_SEQ_PRINT("\t[[UUID: %pU]]\n", device->uuid);
+ 	BTRFS_SEQ_PRINT("\t\tdev_addr:\t%p\n", device);
+@@ -460,6 +481,38 @@ static void print_a_device(struct seq_file *seq, struct btrfs_device *device,
+ 						wb->congested->state);
+ 			}
+ 		}
++		BTRFS_SEQ_PRINT("\t\tqueue_nonrot:\t\t%d\n",
++				blk_queue_nonrot(bdev_get_queue(device->bdev)));
++		BTRFS_SEQ_PRINT("\t\tqueue_depth:\t\t%u\n",
++				bdev_get_queue(device->bdev)->queue_depth);
++		BTRFS_SEQ_PRINT("\t\tnr_hw_queue:\t\t%u\n",
++				bdev_get_queue(device->bdev)->nr_hw_queues);
++		BTRFS_SEQ_PRINT("\t\tnr_requests:\t\t%lu\n",
++				bdev_get_queue(device->bdev)->nr_requests);
++		BTRFS_SEQ_PRINT("\t\tis_multi_queue:\t\t%d\n",
++				queue_is_mq(bdev_get_queue(device->bdev)));
++#ifdef BLOCK_STAT
++		inflight = part_stat_read_inflight(bdev_get_queue(device->bdev),
++						   device->bdev->bd_part);
++		BTRFS_SEQ_PRINT("\t\tinflight:\t\t%d\n", inflight);
++		part_stat_read_all(device->bdev->bd_part, &stat);
++		total_sectors = stat.sectors[STAT_READ] +
++				stat.sectors[STAT_WRITE] +
++				stat.sectors[STAT_DISCARD] +
++				stat.sectors[STAT_FLUSH];
++		total_wait_msecs = div_u64(stat.nsecs[STAT_READ] +
++					   stat.nsecs[STAT_WRITE] +
++					   stat.nsecs[STAT_DISCARD] +
++					   stat.nsecs[STAT_FLUSH], NSEC_PER_MSEC);
++		avg_wait_msecs = div_u64(total_sectors, total_wait_msecs);
++		estimated_wait = blk_queue_nonrot(bdev_get_queue(device->bdev)) ?
++				 10 * inflight * avg_wait_msecs :
++				 inflight * avg_wait_msecs;
++		BTRFS_SEQ_PRINT("\t\ttotal_sectors:\t\t%u\n", total_sectors);
++		BTRFS_SEQ_PRINT("\t\ttotal_wait_msecs:\t%u\n", total_wait_msecs);
++		BTRFS_SEQ_PRINT("\t\tavg_wait_msecs:\t\t%u\n", avg_wait_msecs);
++		BTRFS_SEQ_PRINT("\t\testimated_wait:\t\t%u\n", estimated_wait);
++#endif
+ 	}
+ }
+ 
+-- 
+2.18.4
+
