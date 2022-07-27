@@ -1,45 +1,48 @@
-From 707b9b7a47073b1756be2ffc8919edad86d4db36 Mon Sep 17 00:00:00 2001
-Message-Id: <707b9b7a47073b1756be2ffc8919edad86d4db36.1610028119.git.anand.jain@oracle.com>
+From 44df6b929a46b25dd40f1f3413c63f7ca465d542 Mon Sep 17 00:00:00 2001
+Message-Id: <44df6b929a46b25dd40f1f3413c63f7ca465d542.1658376934.git.anand.jain@oracle.com>
+In-Reply-To: <cover.1658376934.git.anand.jain@oracle.com>
+References: <cover.1658376934.git.anand.jain@oracle.com>
 From: Anand Jain <anand.jain@oracle.com>
 Date: Thu, 7 Jan 2021 21:59:54 +0800
-Subject: [PATCH] btrfs: boilerplate: procfs devlist and fsinfo
+Subject: [PATCH 1/2] btrfs: boilerplate: procfs devlist fsinfo chunklist and
+ bg
 
 ** This patch is not for integration but to debug/visualize the
 btrfs device list and fs_info. **
 
 usage:
-        cat /proc/fs/btrfs/devlist
-        cat /proc/fs/btrfs/fsinfo
+$ cat /proc/fs/btrfs/
+  barpoll  blockgroups  chunklist  devlist  foopoll  fsinfo
 
 Signed-off-by: Anand Jain <anand.jain@oracle.com>
 ---
  fs/btrfs/Makefile |   2 +-
- fs/btrfs/procfs.c | 611 ++++++++++++++++++++++++++++++++++++++++++++++
- fs/btrfs/procfs.h |   7 +
- fs/btrfs/super.c  |   6 +-
- 4 files changed, 624 insertions(+), 2 deletions(-)
+ fs/btrfs/procfs.c | 981 ++++++++++++++++++++++++++++++++++++++++++++++
+ fs/btrfs/procfs.h |  10 +
+ fs/btrfs/super.c  |   5 +
+ 4 files changed, 997 insertions(+), 1 deletion(-)
  create mode 100644 fs/btrfs/procfs.c
  create mode 100644 fs/btrfs/procfs.h
 
 diff --git a/fs/btrfs/Makefile b/fs/btrfs/Makefile
-index 9f1b1a88e317..56e451363b8b 100644
+index 99f9995670ea..b0bb7a2333fc 100644
 --- a/fs/btrfs/Makefile
 +++ b/fs/btrfs/Makefile
-@@ -11,7 +11,7 @@ btrfs-y += super.o ctree.o extent-tree.o print-tree.o root-tree.o dir-item.o \
- 	   compression.o delayed-ref.o relocation.o delayed-inode.o scrub.o \
- 	   reada.o backref.o ulist.o qgroup.o send.o dev-replace.o raid56.o \
+@@ -31,7 +31,7 @@ btrfs-y += super.o ctree.o extent-tree.o print-tree.o root-tree.o dir-item.o \
+ 	   backref.o ulist.o qgroup.o send.o dev-replace.o raid56.o \
  	   uuid-tree.o props.o free-space-tree.o tree-checker.o space-info.o \
--	   block-rsv.o delalloc-space.o block-group.o discard.o reflink.o
-+	   block-rsv.o delalloc-space.o block-group.o discard.o reflink.o procfs.o
+ 	   block-rsv.o delalloc-space.o block-group.o discard.o reflink.o \
+-	   subpage.o tree-mod-log.o
++	   subpage.o tree-mod-log.o procfs.o
  
  btrfs-$(CONFIG_BTRFS_FS_POSIX_ACL) += acl.o
  btrfs-$(CONFIG_BTRFS_FS_CHECK_INTEGRITY) += check-integrity.o
 diff --git a/fs/btrfs/procfs.c b/fs/btrfs/procfs.c
 new file mode 100644
-index 000000000000..2ab79a8ffa3a
+index 000000000000..bb720f239543
 --- /dev/null
 +++ b/fs/btrfs/procfs.c
-@@ -0,0 +1,611 @@
+@@ -0,0 +1,981 @@
 +// SPDX-License-Identifier: GPL-2.0
 +/*
 + * Copyright (C) 2021 Oracle.  All rights reserved.
@@ -48,9 +51,12 @@ index 000000000000..2ab79a8ffa3a
 +#include <linux/seq_file.h>
 +#include <linux/vmalloc.h>
 +#include <linux/proc_fs.h>
++#include <linux/btrfs_tree.h>
 +#include "ctree.h"
 +#include "volumes.h"
 +#include "rcu-string.h"
++#include "block-group.h"
++#include "space-info.h"
 +#include "procfs.h"
 +
 +#define BPSL	256
@@ -58,41 +64,58 @@ index 000000000000..2ab79a8ffa3a
 +#define BTRFS_PROC_PATH		"fs/btrfs"
 +#define BTRFS_PROC_DEVLIST	"devlist"
 +#define BTRFS_PROC_FSINFO	"fsinfo"
++#define BTRFS_PROC_CHUNKLIST	"chunklist"
++#define BTRFS_PROC_BGS		"blockgroups"
 +
 +//#define USE_ALLOC_LIST
 +//#define VOL_FLAGS
 +//#define FS_OPEN_RW
 +#define BALANCE_RUNNING
 +//#define OLD_PROC
++//#define CHUNK_LAYOUT
++#define READPOLICY
++//#define READPOLICY_DYNAMIC_LATENCY
++#define DEVTYPE
++//#define DEVTYPE_MIXED
++#define NO_RENAME_OPENED_RW
 +
 +struct proc_dir_entry	*btrfs_proc_root;
 +
 +static void fs_state_to_str(struct btrfs_fs_info *fs_info, char *str)
 +{
++	memset(str, 0, 256);
 +	if (test_bit(BTRFS_FS_STATE_ERROR, &fs_info->fs_state))
 +		strcat(str, "|ERROR");
 +	if (test_bit(BTRFS_FS_STATE_REMOUNTING, &fs_info->fs_state))
 +		strcat(str, "|REMOUNTING");
++	if (test_bit(BTRFS_FS_STATE_RO, &fs_info->fs_state))
++		strcat(str, "|RO");
 +	if (test_bit(BTRFS_FS_STATE_TRANS_ABORTED, &fs_info->fs_state))
 +		strcat(str, "|TRANS_ABORTED");
 +	if (test_bit(BTRFS_FS_STATE_DEV_REPLACING, &fs_info->fs_state))
 +		strcat(str, "|REPLACING");
 +	if (test_bit(BTRFS_FS_STATE_DUMMY_FS_INFO, &fs_info->fs_state))
 +		strcat(str, "|DUMMY");
++	if (test_bit(BTRFS_FS_STATE_NO_CSUMS, &fs_info->fs_state))
++		strcat(str, "|NO_CSUMS");
++	if (test_bit(BTRFS_FS_STATE_LOG_CLEANUP_ERROR, &fs_info->fs_state))
++		strcat(str, "|LOG_CLEANUP_ERROR");
++	strcat(str, ".");
 +}
 +
 +static void fs_flags_to_str(struct btrfs_fs_info *fs_info, char *str)
 +{
-+	if (test_bit(BTRFS_FS_BARRIER, &fs_info->flags))
-+		strcat(str, "|BARRIER");
++	memset(str, 0, 256);
 +	if (test_bit(BTRFS_FS_CLOSING_START, &fs_info->flags))
 +		strcat(str, "|CLOSING_START");
 +	if (test_bit(BTRFS_FS_CLOSING_DONE, &fs_info->flags))
 +		strcat(str, "|CLOSING_DONE");
 +	if (test_bit(BTRFS_FS_LOG_RECOVERING, &fs_info->flags))
 +		strcat(str, "|RECOVERING");
-+	if (test_bit(BTRFS_FS_OPEN, &fs_info->flags))
-+		strcat(str, "|OPEN");
++#ifndef NO_RENAME_OPENED_RW
++	if (test_bit(BTRFS_FS_OPENED_RW, &fs_info->flags))
++		strcat(str, "|OPENED_RW");
++#endif
 +	if (test_bit(BTRFS_FS_QUOTA_ENABLED, &fs_info->flags))
 +		strcat(str, "|QUOTA_ENABLED");
 +	if (test_bit(BTRFS_FS_UPDATE_UUID_TREE_GEN, &fs_info->flags))
@@ -120,24 +143,24 @@ index 000000000000..2ab79a8ffa3a
 +		strcat(str, "|BALANCE_PAUSEREQ");
 +	if (atomic_read(&fs_info->balance_cancel_req))
 +		strcat(str, "|BALANCE_CANCELREQ");
++	strcat(str, ".");
 +}
 +
-+static void balance_ctl_flags_to_str(struct btrfs_balance_control *bctl,
-+				     char *str)
++static void balance_flags_to_str(u64 flags, char *str)
 +{
-+	if (BTRFS_BALANCE_DATA & bctl->flags)
++	if (BTRFS_BALANCE_DATA & flags)
 +		strcat(str, "|DATA");
-+	if (BTRFS_BALANCE_SYSTEM & bctl->flags)
++	if (BTRFS_BALANCE_SYSTEM & flags)
 +		strcat(str, "|SYSTEM");
-+	if (BTRFS_BALANCE_METADATA & bctl->flags)
++	if (BTRFS_BALANCE_METADATA & flags)
 +		strcat(str, "|METADATA");
-+	if (BTRFS_BALANCE_FORCE & bctl->flags)
++	if (BTRFS_BALANCE_FORCE & flags)
 +		strcat(str, "|FORCE");
-+	if (BTRFS_BALANCE_RESUME & bctl->flags)
++	if (BTRFS_BALANCE_RESUME & flags)
 +		strcat(str, "|RESUME");
 +}
 +
-+static char *bg_flags_to_str(u64 chunk_type, char *str)
++char *bg_flags_to_str(u64 chunk_type, char *str)
 +{
 +	if (chunk_type & BTRFS_BLOCK_GROUP_RAID0)
 +		strcat(str, "|RAID0");
@@ -155,6 +178,45 @@ index 000000000000..2ab79a8ffa3a
 +		strcat(str, "|ALLOC_SINGLE");
 +
 +	return str;
++}
++
++struct btrfs_bg_attr {
++	const char name[10];
++};
++
++enum btrfs_bg_types {
++	BTRFS_BG_SYSTEM,
++	BTRFS_BG_MIXED,
++	BTRFS_BG_DATA,
++	BTRFS_BG_METADATA,
++	BTRFS_NR_BG_TYPES
++};
++
++const struct btrfs_bg_attr btrfs_bg_type[BTRFS_NR_BG_TYPES] = {
++	[BTRFS_BG_SYSTEM] =  {
++		.name = "system",
++	},
++	[BTRFS_BG_MIXED] =  {
++		.name = "mixed",
++	},
++	[BTRFS_BG_DATA] =  {
++		.name = "data",
++	},
++	[BTRFS_BG_METADATA] =  {
++		.name = "metadata",
++	},
++};
++
++static enum btrfs_bg_types btrfs_bg_type_index(u64 flags)
++{
++	if ((flags & BTRFS_BLOCK_GROUP_TYPE_MASK) ==
++	    (BTRFS_BLOCK_GROUP_DATA|BTRFS_BLOCK_GROUP_METADATA))
++		return BTRFS_BG_MIXED;
++	if (flags & BTRFS_BLOCK_GROUP_DATA)
++		return BTRFS_BG_DATA;
++	if (flags & BTRFS_BLOCK_GROUP_METADATA)
++		return BTRFS_BG_METADATA;
++	return BTRFS_BG_SYSTEM;
 +}
 +
 +static void balance_args_to_str(struct btrfs_balance_args *bargs, char *str,
@@ -253,6 +315,40 @@ index 000000000000..2ab79a8ffa3a
 +	ret = sprintf(str, "completed=%llu ", bstat->completed);
 +}
 +
++static inline char *excl_ops_str(struct btrfs_fs_info *fs_info)
++{
++	char *str;
++
++	switch (READ_ONCE(fs_info->exclusive_operation)) {
++	case  BTRFS_EXCLOP_NONE:
++		str = "none\n";
++		break;
++	case BTRFS_EXCLOP_BALANCE:
++		str = "balance\n";
++		break;
++	case BTRFS_EXCLOP_DEV_ADD:
++		str = "device add\n";
++		break;
++	case BTRFS_EXCLOP_DEV_REMOVE:
++		str = "device remove\n";
++		break;
++	case BTRFS_EXCLOP_DEV_REPLACE:
++		str = "device replace\n";
++		break;
++	case BTRFS_EXCLOP_RESIZE:
++		str = "resize\n";
++		break;
++	case BTRFS_EXCLOP_SWAP_ACTIVATE:
++		str = "swap activate\n";
++		break;
++	default:
++		str = "UNKNOWN\n";
++		break;
++	}
++
++	return str;
++}
++
 +void btrfs_print_fsinfo(struct seq_file *seq)
 +{
 +	/* Btrfs Procfs String Len */
@@ -279,20 +375,20 @@ index 000000000000..2ab79a8ffa3a
 +		if (!fs_info)
 +			continue;
 +
-+		BTRFS_SEQ_PRINT2("[fsid: %pU]\n", fs_devices->fsid);
++		BTRFS_SEQ_PRINT2("[fsid_sb: %pU]\n", fs_info->super_copy->fsid);
++		BTRFS_SEQ_PRINT2("\tsb->s_uuid:\t\t%pUb\n", &fs_info->sb->s_uuid);
 +		BTRFS_SEQ_PRINT2("\tsb->s_bdev:\t\t%s\n",
 +				fs_info->sb->s_bdev ?
 +					bdevname(fs_info->sb->s_bdev, b) :
 +					"null");
 +		BTRFS_SEQ_PRINT2("\tlatest_bdev:\t\t%s\n",
-+				fs_devices->latest_bdev ?
-+					bdevname(fs_devices->latest_bdev, b) :
-+					"null");
++				  fs_devices->latest_dev->bdev ?
++				  bdevname(fs_devices->latest_dev->bdev, b) :
++				  "null");
 +
 +		fs_state_to_str(fs_info, fs_str);
 +		BTRFS_SEQ_PRINT2("\tfs_state:\t\t%s\n", fs_str);
 +
-+		memset(fs_str, '\0', 256);
 +		fs_flags_to_str(fs_info, fs_str);
 +		BTRFS_SEQ_PRINT2("\tfs_flags:\t\t%s\n", fs_str);
 +
@@ -303,9 +399,11 @@ index 000000000000..2ab79a8ffa3a
 +		BTRFS_SEQ_PRINT2("\tnodesize\t\t%u\n", fs_info->nodesize);
 +		BTRFS_SEQ_PRINT2("\tsectorsize\t\t%u\n", fs_info->sectorsize);
 +
++		BTRFS_SEQ_PRINT2("\texclusive_operation\t\t%s\n", excl_ops_str(fs_info));
++
 +		if (fs_info->balance_ctl) {
 +			memset(fs_str, '\0', 256);
-+			balance_ctl_flags_to_str(fs_info->balance_ctl, fs_str);
++			balance_flags_to_str(fs_info->balance_ctl->flags, fs_str);
 +			BTRFS_SEQ_PRINT2("\tbalance_control\t\t%s\n", fs_str);
 +
 +			if (fs_info->balance_ctl->flags & BTRFS_BALANCE_DATA)
@@ -349,6 +447,12 @@ index 000000000000..2ab79a8ffa3a
 +				 fs_info->dev_replace.tgtdev);
 +		BTRFS_SEQ_PRINT2("\tdev_replace.bio_counter.count\t\t%llu\n",
 +				 fs_info->dev_replace.bio_counter.count);
++#ifdef CHUNK_LAYOUT
++		BTRFS_SEQ_PRINT2("\tchunk_layout data\t\t\t%d\n",
++				 fs_info->chunk_layout_data);
++		BTRFS_SEQ_PRINT2("\tchunk_layout metadata\t\t\t%d\n",
++				 fs_info->chunk_layout_metadata);
++#endif
 +	}
 +}
 +
@@ -365,7 +469,7 @@ index 000000000000..2ab79a8ffa3a
 +	if (test_bit(BTRFS_DEV_STATE_FLUSH_SENT, &device->dev_state))
 +		strcat(dev_state_str, "|FLUSH_SENT");
 +#ifdef READPOLICY
-+	if (test_bit(BTRFS_DEV_STATE_RD_PREFERRED, &device->dev_state))
++	if (test_bit(BTRFS_DEV_STATE_READ_PREFERRED, &device->dev_state))
 +		strcat(dev_state_str, "|RD_PREFFRRED");
 +#endif
 +	if (device->dev_stats_valid)
@@ -409,12 +513,17 @@ index 000000000000..2ab79a8ffa3a
 +	BTRFS_SEQ_PRINT("\t\tdevice:\t\t%s\n",
 +			device->name ? rcu_str_deref(device->name) : "(null)");
 +	rcu_read_unlock();
++	BTRFS_SEQ_PRINT("\t\tdev_t:\t\t%u\n", device->devt);
++	BTRFS_SEQ_PRINT("\t\tmajor:\t\t%u\n", MAJOR(device->devt));
 +	BTRFS_SEQ_PRINT("\t\tdevid:\t\t%llu\n", device->devid);
 +	BTRFS_SEQ_PRINT("\t\tgeneration:\t%llu\n", device->generation);
 +	BTRFS_SEQ_PRINT("\t\ttotal_bytes:\t%llu\n", device->total_bytes);
 +	BTRFS_SEQ_PRINT("\t\tdev_totalbytes:\t%llu\n", device->disk_total_bytes);
 +	BTRFS_SEQ_PRINT("\t\tbytes_used:\t%llu\n", device->bytes_used);
 +	BTRFS_SEQ_PRINT("\t\ttype:\t\t%llu\n", device->type);
++#ifdef DEVTYPE
++	BTRFS_SEQ_PRINT("\t\tdev_type:\t%u\n", device->dev_type);
++#endif
 +	BTRFS_SEQ_PRINT("\t\tio_align:\t%u\n", device->io_align);
 +	BTRFS_SEQ_PRINT("\t\tio_width:\t%u\n", device->io_width);
 +	BTRFS_SEQ_PRINT("\t\tsector_size:\t%u\n", device->sector_size);
@@ -426,10 +535,10 @@ index 000000000000..2ab79a8ffa3a
 +		BTRFS_SEQ_PRINT("\t\tdev_state:\t%s\n", dev_state_str);
 +
 +	if (device->devid_kobj.state_initialized)
-+		BTRFS_SEQ_PRINT("\t\tdevid_kobj:\t\t%d\n", device->devid_kobj.state_initialized);
++		BTRFS_SEQ_PRINT("\t\tdevid_kobj:\t%d\n", device->devid_kobj.state_initialized);
 +	else
-+		BTRFS_SEQ_PRINT("\t\tdevid_kobj:\t\t%s\n", "null");
-+
++		BTRFS_SEQ_PRINT("\t\tdevid_kobj:\t%s\n", "null");
++#if 0
 +	BTRFS_SEQ_PRINT("\t\tbdev:\t\t%s\n", device->bdev ? "not_null":"null");
 +	if (device->bdev) {
 +		struct backing_dev_info *bdi = device->bdev->bd_bdi;
@@ -447,6 +556,10 @@ index 000000000000..2ab79a8ffa3a
 +			}
 +		}
 +	}
++#endif
++#ifdef READPOLICY_DYNAMIC_LATENCY
++	BTRFS_SEQ_PRINT("\t\tavg_read_latency:\t\t%llu\n", device->avg_read_latency);
++#endif
 +}
 +
 +static void print_a_fs_device(struct seq_file *seq, struct btrfs_fs_devices *fs_devices,
@@ -482,6 +595,10 @@ index 000000000000..2ab79a8ffa3a
 +	BTRFS_SEQ_PRINT("\ttotal_rw_bytes:\t\t%llu\n", fs_devices->total_rw_bytes);
 +	BTRFS_SEQ_PRINT("\ttotal_devices:\t\t%llu\n", fs_devices->total_devices);
 +	BTRFS_SEQ_PRINT("\topened:\t\t\t%d\n", fs_devices->opened);
++#ifdef DEVTYPE_MIXED
++	BTRFS_SEQ_PRINT("\tmixed_dev_types:\t%s\n",
++			fs_devices->mixed_dev_types ? "True" : "False");
++#endif
 +#ifdef VOL_FLAGS
 +	vol_flags_to_str(fs_devices, vol_flags);
 +	BTRFS_SEQ_PRINT("\vol_flags:\\%s\n", vol_flags);
@@ -509,7 +626,7 @@ index 000000000000..2ab79a8ffa3a
 +		break;
 +	case BTRFS_READ_POLICY_DEVICE:
 +		list_for_each_entry(device, &fs_devices->devices, dev_list) {
-+			if (test_bit(BTRFS_DEV_STATE_RD_PREFERRED, &device->dev_state))
++			if (test_bit(BTRFS_DEV_STATE_READ_PREFERRED, &device->dev_state))
 +				BTRFS_SEQ_PRINT("%llu ", device->devid);
 +		}
 +		BTRFS_SEQ_PRINT("%s\n", " ");
@@ -576,6 +693,137 @@ index 000000000000..2ab79a8ffa3a
 +	}
 +}
 +
++#define bufsize 4096
++char global_buf[bufsize];
++
++char retstr[60];
++int retstr_size = 60;
++
++inline int em_flag_to_str(unsigned long *flags)
++{
++	int ret = 0;
++
++	memset(retstr, 0, retstr_size);
++
++	if (test_bit(EXTENT_FLAG_PINNED, flags))
++		ret += snprintf(retstr + ret, retstr_size - ret, "%s|", "PINNED");
++	if (test_bit(EXTENT_FLAG_COMPRESSED, flags))
++		ret += snprintf(retstr + ret, retstr_size - ret, "%s|", "COMPRESSED");
++	if (test_bit(EXTENT_FLAG_PREALLOC, flags))
++		ret += snprintf(retstr + ret, retstr_size - ret, "%s|", "PREALLOC");
++	if (test_bit(EXTENT_FLAG_LOGGING, flags))
++		ret += snprintf(retstr + ret, retstr_size - ret, "%s|", "LOGGING");
++	if (test_bit(EXTENT_FLAG_FILLING, flags))
++		ret += snprintf(retstr + ret, retstr_size - ret, "%s|", "FILING");
++	if (test_bit(EXTENT_FLAG_FS_MAPPING, flags))
++		ret += snprintf(retstr + ret, retstr_size - ret, "%s|", "FS_MAPPING");
++
++	if (ret)
++		retstr[ret - 1] = '\0';
++
++	return ret;
++}
++
++#define append_to_buf(fmt, arg) { \
++	if (aptr >= bufsize) \
++		printk("Boilerplate Error: bufsize %d too small %lu\n", \
++			bufsize, aptr); \
++	aptr += snprintf(global_buf + aptr, bufsize - aptr, fmt, arg); }
++
++
++static char *btrfs_dump_chunklist(struct btrfs_fs_info *fs_info)
++{
++	struct extent_map_tree *map_tree = &fs_info->mapping_tree;
++	struct extent_map *em;
++	u64 next_start = 0;
++	size_t aptr = 0;
++
++	memset(global_buf, 0, bufsize);
++
++	read_lock(&map_tree->lock);
++	em = lookup_extent_mapping(map_tree, 0, (u64)-1);
++	read_unlock(&map_tree->lock);
++	/* No chunk at all? Return false anyway */
++	if (!em)
++		return ERR_PTR(-EINTR);
++
++	append_to_buf("[fsid: %pU]\n", fs_info->fs_devices->fsid);
++	while (em) {
++		int i;
++		struct map_lookup *map = em->map_lookup;
++
++		append_to_buf("extent_map:%s\n", "");
++		append_to_buf("start:\t\t%llu\n", em->start);
++		append_to_buf("len:\t\t%llu\n", em->len);
++		append_to_buf("mod_start:\t%llu\n", em->mod_start);
++		append_to_buf("mod_len:\t%llu\n", em->mod_len);
++		append_to_buf("orig_start:\t%llu\n", em->orig_start);
++		append_to_buf("orig_block_len:\t%llu\n", em->orig_block_len);
++		append_to_buf("ram_bytes:\t%llu\n", em->ram_bytes);
++		append_to_buf("block_start:\t%llu\n", em->block_start);
++		append_to_buf("block_len:\t%llu\n", em->block_len);
++		append_to_buf("generication:\t%llu\n", em->generation);
++		append_to_buf("flags:\t\t0x%lx", em->flags);
++		em_flag_to_str(&em->flags);
++		append_to_buf(" %s\n", retstr);
++		append_to_buf("refcount:\t%u\n", refcount_read(&em->refs));
++		append_to_buf("compress_type:\t%u\n\n", em->compress_type);
++
++		append_to_buf("map_lookup:%s\n", "");
++		append_to_buf("type:\t\t0x%llx", map->type);
++		append_to_buf(" %s|",
++			      btrfs_bg_type[btrfs_bg_type_index(map->type)].name);
++		append_to_buf("%s\n", btrfs_bg_type_to_raid_name(map->type));
++		append_to_buf("io_align:\t%d\n", map->io_align);
++		append_to_buf("io_width:\t%d\n", map->io_width);
++		append_to_buf("stripe_len:\t%u\n", map->stripe_len);
++		append_to_buf("num_stripes:\t%d\n", map->num_stripes);
++		append_to_buf("sub_stripes:\t%d\n", map->sub_stripes);
++		append_to_buf("verified_stripes:%d\n", map->verified_stripes);
++
++		for (i = 0; i < map->num_stripes; i++) {
++			append_to_buf("devid:\t\t%llu\n", map->stripes[i].dev->devid);
++			append_to_buf("\tphysical:%llu\n", map->stripes[i].physical);
++		}
++		append_to_buf("-------------%s--------------\n", "x");
++
++		next_start = extent_map_end(em);
++		free_extent_map(em);
++		read_lock(&map_tree->lock);
++		em = lookup_extent_mapping(map_tree, next_start,
++					   (u64)(-1) - next_start);
++		read_unlock(&map_tree->lock);
++	}
++
++	return global_buf;
++}
++
++static int btrfs_chunklist_show(struct seq_file *seq, void *inode)
++{
++	char *buf;
++	struct list_head *cur_uuid;
++	struct btrfs_fs_info *fs_info;
++	struct btrfs_fs_devices *fs_devices;
++	struct list_head *fs_uuids = btrfs_get_fs_uuids();
++
++	seq_puts(seq, "\n#Its Experimental, parameters may change without notice.\n\n");
++
++	list_for_each(cur_uuid, fs_uuids) {
++		fs_devices  = list_entry(cur_uuid, struct btrfs_fs_devices, fs_list);
++		fs_info = fs_devices->fs_info;
++		if (!fs_info)
++			continue;
++
++		buf = btrfs_dump_chunklist(fs_info);
++		if (IS_ERR(buf))
++			continue;
++
++		seq_printf(seq, "%s", buf);
++	}
++
++	return 0;
++}
++
 +static int btrfs_fsinfo_show(struct seq_file *seq, void *offset)
 +{
 +	btrfs_print_fsinfo(seq);
@@ -588,14 +836,99 @@ index 000000000000..2ab79a8ffa3a
 +	return 0;
 +}
 +
++static char *btrfs_dump_bgs(struct btrfs_fs_info *fs_info)
++{
++	struct extent_map_tree *map_tree = &fs_info->mapping_tree;
++	struct extent_map *em;
++	struct btrfs_block_group *cache = NULL;
++	u64 next_start = 0;
++	size_t aptr = 0;
++
++	memset(global_buf, 0, bufsize);
++
++	append_to_buf("[fsid: %pU]\n", fs_info->fs_devices->fsid);
++
++	read_lock(&map_tree->lock);
++	em = lookup_extent_mapping(map_tree, 0, (u64)-1);
++	read_unlock(&map_tree->lock);
++	if (!em)
++		return ERR_PTR(-EINTR);
++
++	while (em) {
++		struct btrfs_space_info *si;
++
++		cache = btrfs_lookup_block_group(fs_info, em->start);
++		if (!cache)
++			break;
++		si = cache->space_info;
++
++		append_to_buf("bg_start:\t%llu\n", cache->start);
++		append_to_buf("len:\t\t%llu\n", cache->length);
++		append_to_buf("readonly:\t%d\n", cache->ro);
++
++		append_to_buf("%s\n", " space_info");
++		append_to_buf("\tdisk_used:\t%llu\n", si->disk_used);
++		append_to_buf("\tdisk_total:\t%llu\n", si->disk_total);
++		append_to_buf("%s\n", " ");
++
++		btrfs_put_block_group(cache);
++
++		next_start = extent_map_end(em);
++		free_extent_map(em);
++
++		read_lock(&map_tree->lock);
++		em = lookup_extent_mapping(map_tree, next_start,
++					   (u64)(-1) - next_start);
++		read_unlock(&map_tree->lock);
++	}
++
++	return global_buf;
++}
++
++static int btrfs_bgs_show(struct seq_file *seq, void *inode)
++{
++	char *buf;
++	struct list_head *cur_uuid;
++	struct btrfs_fs_info *fs_info;
++	struct btrfs_fs_devices *fs_devices;
++	struct list_head *fs_uuids = btrfs_get_fs_uuids();
++
++	seq_puts(seq, "\n#Its Experimental, parameters may change without notice.\n\n");
++
++	list_for_each(cur_uuid, fs_uuids) {
++		fs_devices  = list_entry(cur_uuid, struct btrfs_fs_devices, fs_list);
++		fs_info = fs_devices->fs_info;
++		if (!fs_info)
++			continue;
++
++		buf = btrfs_dump_bgs(fs_info);
++		if (IS_ERR(buf))
++			continue;
++
++		seq_printf(seq, "%s", buf);
++	}
++
++	return 0;
++}
++
 +static int btrfs_seq_fsinfo_open(struct inode *inode, struct file *file)
 +{
-+	return single_open(file, btrfs_fsinfo_show, PDE_DATA(inode));
++	return single_open(file, btrfs_fsinfo_show, inode->i_private);
 +}
 +
 +static int btrfs_seq_devlist_open(struct inode *inode, struct file *file)
 +{
-+	return single_open(file, btrfs_devlist_show, PDE_DATA(inode));
++	return single_open(file, btrfs_devlist_show, inode->i_private);
++}
++
++static int btrfs_seq_chunklist_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, btrfs_chunklist_show, inode->i_private);
++}
++
++static int btrfs_seq_bgs_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, btrfs_bgs_show, inode->i_private);
 +}
 +
 +#ifdef OLD_PROC
@@ -632,6 +965,40 @@ index 000000000000..2ab79a8ffa3a
 +};
 +#endif
 +
++#ifdef OLD_PROC
++static const struct file_operations btrfs_seq_chunklist_fops = {
++	.owner	 = THIS_MODULE,
++	.open	 = btrfs_seq_chunklist_open,
++	.read	 = seq_read,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++#else
++static const struct proc_ops btrfs_seq_chunklist_fops = {
++	.proc_open	= btrfs_seq_chunklist_open,
++	.proc_read	= seq_read,
++	.proc_lseek	= seq_lseek,
++	.proc_release	= single_release,
++};
++#endif
++
++#ifdef OLD_PROC
++static const struct file_operations btrfs_seq_bgs_fops = {
++	.owner	 = THIS_MODULE,
++	.open	 = btrfs_seq_bgs_open,
++	.read	 = seq_read,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++#else
++static const struct proc_ops btrfs_seq_bgs_fops = {
++	.proc_open	= btrfs_seq_bgs_open,
++	.proc_read	= seq_read,
++	.proc_lseek	= seq_lseek,
++	.proc_release	= single_release,
++};
++#endif
++
 +void btrfs_init_procfs(void)
 +{
 +	btrfs_proc_root = proc_mkdir(BTRFS_PROC_PATH, NULL);
@@ -640,6 +1007,10 @@ index 000000000000..2ab79a8ffa3a
 +					&btrfs_seq_devlist_fops, NULL);
 +		proc_create_data(BTRFS_PROC_FSINFO, 0444, btrfs_proc_root,
 +					&btrfs_seq_fsinfo_fops, NULL);
++		proc_create_data(BTRFS_PROC_CHUNKLIST, 0444, btrfs_proc_root,
++					&btrfs_seq_chunklist_fops, NULL);
++		proc_create_data(BTRFS_PROC_BGS, 0444, btrfs_proc_root,
++					&btrfs_seq_bgs_fops, NULL);
 +	}
 +}
 +
@@ -648,15 +1019,17 @@ index 000000000000..2ab79a8ffa3a
 +	if (btrfs_proc_root) {
 +		remove_proc_entry(BTRFS_PROC_DEVLIST, btrfs_proc_root);
 +		remove_proc_entry(BTRFS_PROC_FSINFO, btrfs_proc_root);
++		remove_proc_entry(BTRFS_PROC_CHUNKLIST, btrfs_proc_root);
++		remove_proc_entry(BTRFS_PROC_BGS, btrfs_proc_root);
 +	}
 +	remove_proc_entry(BTRFS_PROC_PATH, NULL);
 +}
 diff --git a/fs/btrfs/procfs.h b/fs/btrfs/procfs.h
 new file mode 100644
-index 000000000000..031947b6c424
+index 000000000000..c5306f92c29e
 --- /dev/null
 +++ b/fs/btrfs/procfs.h
-@@ -0,0 +1,7 @@
+@@ -0,0 +1,10 @@
 +/* SPDX-License-Identifier: GPL-2.0 */
 +/*
 + * Copyright (C) 2021 Oracle.  All rights reserved.
@@ -664,20 +1037,22 @@ index 000000000000..031947b6c424
 +
 +void btrfs_exit_procfs(void);
 +void btrfs_init_procfs(void);
++void btrfs_print_fsinfo(struct seq_file *seq);
++void btrfs_print_devlist(struct seq_file *seq, struct btrfs_fs_devices *the_fs_devices);
++char *bg_flags_to_str(u64 chunk_type, char *str);
 diff --git a/fs/btrfs/super.c b/fs/btrfs/super.c
-index 12d7d3be7cd4..59d02afd086c 100644
+index 4c7089b1681b..34ef4f9f2920 100644
 --- a/fs/btrfs/super.c
 +++ b/fs/btrfs/super.c
-@@ -48,7 +48,7 @@
- #include "tests/btrfs-tests.h"
- #include "block-group.h"
- #include "discard.h"
--
-+#include "procfs.h"
- #include "qgroup.h"
+@@ -51,6 +51,7 @@
+ #include "raid56.h"
  #define CREATE_TRACE_POINTS
  #include <trace/events/btrfs.h>
-@@ -2566,6 +2566,8 @@ static int __init init_btrfs_fs(void)
++#include "procfs.h"
+ 
+ static const struct super_operations btrfs_super_ops;
+ 
+@@ -2654,6 +2655,8 @@ static int __init init_btrfs_fs(void)
  	if (err)
  		return err;
  
@@ -686,7 +1061,7 @@ index 12d7d3be7cd4..59d02afd086c 100644
  	btrfs_init_compress();
  
  	err = btrfs_init_cachep();
-@@ -2648,6 +2650,7 @@ static int __init init_btrfs_fs(void)
+@@ -2730,6 +2733,7 @@ static int __init init_btrfs_fs(void)
  	btrfs_destroy_cachep();
  free_compress:
  	btrfs_exit_compress();
@@ -694,14 +1069,14 @@ index 12d7d3be7cd4..59d02afd086c 100644
  	btrfs_exit_sysfs();
  
  	return err;
-@@ -2667,6 +2670,7 @@ static void __exit exit_btrfs_fs(void)
+@@ -2748,6 +2752,7 @@ static void __exit exit_btrfs_fs(void)
+ 	extent_io_exit();
  	btrfs_interface_exit();
- 	btrfs_end_io_wq_exit();
  	unregister_filesystem(&btrfs_fs_type);
 +	btrfs_exit_procfs();
  	btrfs_exit_sysfs();
  	btrfs_cleanup_fs_uuids();
  	btrfs_exit_compress();
 -- 
-2.18.4
+2.33.1
 

@@ -1,0 +1,252 @@
+From 90a32ad281e5ec8ce658f29772d42deabb37978b Mon Sep 17 00:00:00 2001
+Message-Id: <90a32ad281e5ec8ce658f29772d42deabb37978b.1658376934.git.anand.jain@oracle.com>
+In-Reply-To: <cover.1658376934.git.anand.jain@oracle.com>
+References: <cover.1658376934.git.anand.jain@oracle.com>
+From: Anand Jain <anand.jain@oracle.com>
+Date: Thu, 28 Oct 2021 14:48:46 +0800
+Subject: [PATCH 2/2] btrfs: boilerplate: procfs foo bar poll
+
+Signed-off-by: Anand Jain <anand.jain@oracle.com>
+---
+ fs/btrfs/procfs.c | 170 ++++++++++++++++++++++++++++++++++++++++++++++
+ fs/btrfs/procfs.h |   4 ++
+ 2 files changed, 174 insertions(+)
+
+diff --git a/fs/btrfs/procfs.c b/fs/btrfs/procfs.c
+index bb720f239543..32814a1c9eeb 100644
+--- a/fs/btrfs/procfs.c
++++ b/fs/btrfs/procfs.c
+@@ -7,6 +7,7 @@
+ #include <linux/vmalloc.h>
+ #include <linux/proc_fs.h>
+ #include <linux/btrfs_tree.h>
++#include <linux/delay.h>
+ #include "ctree.h"
+ #include "volumes.h"
+ #include "rcu-string.h"
+@@ -21,6 +22,8 @@
+ #define BTRFS_PROC_FSINFO	"fsinfo"
+ #define BTRFS_PROC_CHUNKLIST	"chunklist"
+ #define BTRFS_PROC_BGS		"blockgroups"
++#define BTRFS_PROC_FOOPOLL	"foopoll"
++#define BTRFS_PROC_BARPOLL	"barpoll"
+ 
+ //#define USE_ALLOC_LIST
+ //#define VOL_FLAGS
+@@ -866,6 +869,119 @@ static int btrfs_bgs_show(struct seq_file *seq, void *inode)
+ 	return 0;
+ }
+ 
++int foopoll = -1;
++int barpoll = -1;
++
++int foopoll_read(void)
++{
++	return foopoll;
++}
++
++static void foopoll_write(int x)
++{
++	foopoll = x;
++}
++
++void foopoll_write_and_wait(struct btrfs_fs_info *fs_info, char *suffix, int x)
++{
++	int old;
++
++	foopoll_write(x);
++	old = foopoll_read();
++
++	btrfs_info(fs_info, "foopoll: %d polling for new write: %s",
++		   foopoll_read(), suffix);
++	while (old == foopoll_read())
++		msleep(100);
++	btrfs_info(fs_info, "foopoll: %d found new write: %s",
++		   foopoll_read(), suffix);
++}
++
++int barpoll_read(void)
++{
++	return barpoll;
++}
++
++static void barpoll_write(int x)
++{
++	barpoll = x;
++}
++
++void barpoll_write_and_wait(struct btrfs_fs_info *fs_info, char *suffix, int x)
++{
++	int old;
++
++	barpoll_write(x);
++	old  = barpoll_read();
++
++	btrfs_info(fs_info, "barpoll: %d polling for new write: %s",
++		   barpoll_read(), suffix);
++	while (old == barpoll_read())
++		msleep(100);
++	btrfs_info(fs_info, "barpoll: %d found new write: %s",
++		   barpoll_read(), suffix);
++}
++
++static ssize_t btrfs_seq_foopoll_write(struct file *file, const char __user *buf,
++				       size_t count, loff_t *pos)
++{
++	char s[256];
++	int val;
++	int ret = 0;
++
++	if (count > 256)
++		return -EINVAL;
++
++	if (copy_from_user(s, buf, count))
++		return -EFAULT;
++
++	s[count] = '\0';
++
++	ret = kstrtoint(s, 10, &val);
++	if (ret)
++		return -ret;
++
++	foopoll = val;
++
++	return count;
++}
++
++static ssize_t btrfs_seq_barpoll_write(struct file *file, const char __user *buf,
++				       size_t count, loff_t *pos)
++{
++	char s[256];
++	int val;
++	int ret = 0;
++
++	if (count > 256)
++		return -EINVAL;
++
++	if (copy_from_user(s, buf, count))
++		return -EFAULT;
++
++	s[count] = '\0';
++
++	ret = kstrtoint(s, 10, &val);
++	if (ret)
++		return -ret;
++
++	barpoll = val;
++
++	return count;
++}
++
++static int btrfs_foopoll_show(struct seq_file *seq, void *inode)
++{
++	seq_printf(seq, "%d\n", foopoll_read());
++	return 0;
++}
++
++static int btrfs_barpoll_show(struct seq_file *seq, void *inode)
++{
++	seq_printf(seq, "%d\n", barpoll_read());
++	return 0;
++}
++
+ static int btrfs_seq_fsinfo_open(struct inode *inode, struct file *file)
+ {
+ 	return single_open(file, btrfs_fsinfo_show, inode->i_private);
+@@ -886,6 +1002,16 @@ static int btrfs_seq_bgs_open(struct inode *inode, struct file *file)
+ 	return single_open(file, btrfs_bgs_show, inode->i_private);
+ }
+ 
++static int btrfs_seq_foopoll_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, btrfs_foopoll_show, inode->i_private);
++}
++
++static int btrfs_seq_barpoll_open(struct inode *inode, struct file *file)
++{
++	return single_open(file, btrfs_barpoll_show, inode->i_private);
++}
++
+ #ifdef OLD_PROC
+ static const struct file_operations btrfs_seq_devlist_fops = {
+ 	.owner   = THIS_MODULE,
+@@ -954,6 +1080,44 @@ static const struct proc_ops btrfs_seq_bgs_fops = {
+ };
+ #endif
+ 
++#ifdef OLD_PROC
++static const struct file_operations btrfs_seq_foopoll_fops = {
++	.owner	 = THIS_MODULE,
++	.open	 = btrfs_seq_foopoll_open,
++	.read	 = seq_read,
++	.write	 = btrfs_seq_foopoll_write,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++#else
++static const struct proc_ops btrfs_seq_foopoll_fops = {
++	.proc_open	= btrfs_seq_foopoll_open,
++	.proc_read	= seq_read,
++	.proc_write	= btrfs_seq_foopoll_write,
++	.proc_lseek	= seq_lseek,
++	.proc_release	= single_release,
++};
++#endif
++
++#ifdef OLD_PROC
++static const struct file_operations btrfs_seq_barpoll_fops = {
++	.owner	 = THIS_MODULE,
++	.open	 = btrfs_seq_barpoll_open,
++	.read	 = seq_read,
++	.write	 = btrfs_seq_barpoll_write,
++	.llseek	 = seq_lseek,
++	.release = single_release,
++};
++#else
++static const struct proc_ops btrfs_seq_barpoll_fops = {
++	.proc_open	= btrfs_seq_barpoll_open,
++	.proc_read	= seq_read,
++	.proc_write	= btrfs_seq_barpoll_write,
++	.proc_lseek	= seq_lseek,
++	.proc_release	= single_release,
++};
++#endif
++
+ void btrfs_init_procfs(void)
+ {
+ 	btrfs_proc_root = proc_mkdir(BTRFS_PROC_PATH, NULL);
+@@ -966,6 +1130,10 @@ void btrfs_init_procfs(void)
+ 					&btrfs_seq_chunklist_fops, NULL);
+ 		proc_create_data(BTRFS_PROC_BGS, 0444, btrfs_proc_root,
+ 					&btrfs_seq_bgs_fops, NULL);
++		proc_create_data(BTRFS_PROC_FOOPOLL, 0444, btrfs_proc_root,
++					&btrfs_seq_foopoll_fops, NULL);
++		proc_create_data(BTRFS_PROC_BARPOLL, 0444, btrfs_proc_root,
++					&btrfs_seq_barpoll_fops, NULL);
+ 	}
+ }
+ 
+@@ -976,6 +1144,8 @@ void btrfs_exit_procfs(void)
+ 		remove_proc_entry(BTRFS_PROC_FSINFO, btrfs_proc_root);
+ 		remove_proc_entry(BTRFS_PROC_CHUNKLIST, btrfs_proc_root);
+ 		remove_proc_entry(BTRFS_PROC_BGS, btrfs_proc_root);
++		remove_proc_entry(BTRFS_PROC_FOOPOLL, btrfs_proc_root);
++		remove_proc_entry(BTRFS_PROC_BARPOLL, btrfs_proc_root);
+ 	}
+ 	remove_proc_entry(BTRFS_PROC_PATH, NULL);
+ }
+diff --git a/fs/btrfs/procfs.h b/fs/btrfs/procfs.h
+index c5306f92c29e..a1148b643431 100644
+--- a/fs/btrfs/procfs.h
++++ b/fs/btrfs/procfs.h
+@@ -8,3 +8,7 @@ void btrfs_init_procfs(void);
+ void btrfs_print_fsinfo(struct seq_file *seq);
+ void btrfs_print_devlist(struct seq_file *seq, struct btrfs_fs_devices *the_fs_devices);
+ char *bg_flags_to_str(u64 chunk_type, char *str);
++void foopoll_write_and_wait(struct btrfs_fs_info *fs_info, char *suffix, int x);
++void barpoll_write_and_wait(struct btrfs_fs_info *fs_info, char *suffix, int x);
++int barpoll_read(void);
++int foopoll_read(void);
+-- 
+2.33.1
+
